@@ -4,9 +4,9 @@ How one HTTP request becomes a charge, who decides what, and where the numbers e
 **what is implemented today** — read this before `PLAN.md`, which does not cover authorization,
 multiplexing or the extra pool.
 
-The reference material is split across `README.md` — "Rate limiter behavior", "TCP contract",
-"Authorization behavior", "Extra credits", "Go charging rules". This document is the flow those
-sections are pieces of.
+The reference material is split across `README.md` — "Authentication", "Rate limiter behavior",
+"TCP contract", "Access management and authorization", "Extra credits", "Go charging rules". This
+document is the flow those sections are pieces of.
 
 ---
 

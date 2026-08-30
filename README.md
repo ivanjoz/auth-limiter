@@ -4,10 +4,10 @@ One Rust process hosting four server-side services over two transports:
 
 | Service | Transport | Port | Purpose |
 |---|---|---|---|
-| Credit rate limiter | Raw TCP, loopback | `server_utils` (default `127.0.0.1:14013`) | Atomic CPU/inference quota checks for the Go backend. |
+| Access gate + credit limiter | Raw TCP, loopback | `server_utils` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
 | Lock service | Raw TCP, same port | `server_utils` | Serializes an action across concurrent Lambdas. |
 | Request log | Raw TCP, same port | `server_utils` | One row per finished request, plus the code lines that failed. |
-| SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between the backend and browser tabs. |
+| SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between the backend and browser tabs, authenticating both ends. |
 
 The limiter, the lock and the request log share the port, the connection, and the handshake —
 nothing else. Each opcode has its own frame width, its own codec, and its own module. That shared port is why its
@@ -16,6 +16,14 @@ belongs to the process, not to any one service inside it.
 
 The bridge shares nothing with either but the process: the config load, the shutdown signal, and
 the tokio runtime. No service calls into another.
+
+**Nothing here is anonymous, and one of these services decides who may do what.** Three separate
+relationships are authenticated with two secrets — the backend to the raw-TCP port, the backend to
+the bridge, the browser to the bridge — and `CHARGE_CREDITS` answers a permission question before it
+answers a cost one, out of a grant cache this process keeps because it is the only one always
+resident. Identity and access are therefore not a layer above this daemon: they are the first thing
+every opcode and every HTTP route resolves. See [Authentication](#authentication) and [Access
+management and authorization](#access-management-and-authorization).
 
 Start with [LOCK_SERVICE_WALKTHROUGH.md](LOCK_SERVICE_WALKTHROUGH.md) — one sign-up request end
 to end, with the exact bytes. Designs: [PLAN.md](PLAN.md) (rate limiter, including all binary
@@ -52,21 +60,42 @@ src/
 ├── sysmetrics/  # no opcode: samples the machine once a second and writes the peak
 │                # of each five-second window to server_metrics. collector (/proc +
 │                # cgroup v2), writer (the tick loop and the insert)
-└── bridge/      # token.rs (colbin + channel token), auth, channel, http (axum)
+└── bridge/      # token.rs (colbin + channel token), auth (the browser's session
+                 # token and the backend's service header), channel, http (axum)
 ```
 
-## Two secrets, split by purpose
+## Authentication
 
-Both are root-level keys in `config.toml` and must match the backend byte for byte:
+Three relationships are authenticated here, each under its own domain string, and none of them costs
+a database round trip:
 
-| Key | Used for |
-|---|---|
-| `internal_apikey` | Service-to-service authentication: the TCP frame HMAC (`genix-server-utils:v5`) and the bridge's `X-Bridge-Auth` header (`sse-bridge:v1\|`). |
-| `secret_phrase` | Verifying the browser's session token only (`usrToken:v1`). Nothing else in this crate reads it. |
+| Who proves what | How | Secret |
+|---|---|---|
+| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `HMAC-SHA256(genix-server-utils:v6 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes. | `internal_apikey` |
+| Backend → SSE bridge | `X-Bridge-Auth: <unix seconds>.<hex signature>`, signed over `sse-bridge:v1\|<unix seconds>` and accepted within ±300 s of this host's clock. | `internal_apikey` |
+| Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend issued, its own HMAC recomputed over `usrToken:v1 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
 
-Each use is domain-separated, so one key serving two protocols cannot produce interchangeable
-tags. Splitting the two means the inter-service key can be rotated without invalidating every
-live session token.
+Both keys are root-level in `config.toml` and must match the backend byte for byte. Each use is
+domain-separated, so one key serving two protocols cannot produce interchangeable tags, and
+splitting the two means the inter-service key can be rotated without invalidating every live session
+token. Every tag is compared in constant time, including the bridge's, where the value is a string
+and the temptation to use `==` is strongest.
+
+**The TCP tag is bound to a connection and to frame order; the bridge's header is not.** The nonce
+makes a captured frame useless on the next connection, the sequence makes it useless on this one,
+and the opcode inside the signed bytes keeps a charge from being replayed as a lock release. The
+service header has none of that, because the caller is a Lambda with no connection to bind to, so it
+carries a five-minute skew window instead — the price of holding no per-caller state.
+
+**The browser is verified from the token alone.** The session token is self-contained, so `GET /sse`
+is answered without ScyllaDB. What the bridge does *not* do is decide permissions: it establishes
+identity and stops there, because the backend already evaluated what this user may do when it
+accepted the turn. A `created` timestamp is signed into the token, but this crate enforces no expiry
+on it — ending a session is the backend's to do.
+
+The channel in the URL is an **identifier, not a credential**, and both client routes cross-check
+that the company and user encoded inside it are the authenticated ones. See
+[Channel token](#channel-token).
 
 ## Rate limiter behavior
 
@@ -331,7 +360,8 @@ cases* for the lock cost none of them, since they are namespaced by the `u16` ac
 `CHARGE_CREDITS` answers **two** questions in one round trip: how much this request costs, and
 whether the caller may make it. `required_access` holds packed `acceso_id << 2 | (nivel - 1)` grants
 the caller must hold at least one of, filled from index 0 with zero terminating; all four zero means
-no authorization was asked for, which is the common case. See "Authorization" below.
+no authorization was asked for, which is the common case. See "Access management and
+authorization" below.
 
 Because the two are independent, a frame is valid with credits, with a required access, or with
 both — but not with neither. An authorize-only frame (zero credits, slots filled) is what the Go
@@ -396,7 +426,7 @@ closed; call sites for locks retain their operation-specific policy.
 The client must assign a sequence and write its frame atomically. Two callers taking 5 and 6 but
 writing 6, 5 would desynchronize the HMAC and every later frame would fail.
 
-## Authorization behavior
+## Access management and authorization
 
 The charge frame also answers "may this user do this", and that is the second reason it exists.
 
@@ -411,6 +441,23 @@ row exists at all. Two bytes per grant — a user holding every access in today'
 bytes, less than the `HashMap` entry around it. It lives in the same shard, behind the same mutex and
 on the same key as the quota state, so a request that both authorizes and charges takes one lock.
 
+**What a grant means.** One `u16`, `acceso_id << 2 | (nivel - 1)`: the access id in the high bits,
+a four-value level in the low two. A required grant is satisfied by any level **at or above** it
+inside the same id — a binary search for the exact value, then one look at the next element to see
+whether it is still under that id's ceiling (`required | 0b11`). A frame carries up to four required
+grants and holding **any one** of them is enough, which is what a route mapped to several accesses
+has always meant. This is `hasPackedAccesoInRange` from `backend/core/responses.go`, ported
+deliberately unchanged: the same algorithm over the same representation is what keeps the two
+processes from drifting into disagreeing about what a grant means.
+
+**Identity first, permission second.** The verdict resolves in that order — no such user, then
+inactive user, then grants — because the three become different HTTP answers on the Go side, and
+collapsing them would tell a user this company no longer has that it merely lacks permission. A
+token whose HMAC checked out but whose `(company, user)` has no row is a 401, `users.status != 1` is
+a 401, and holding none of the required accesses is a 403. Status `1` is the only value that means
+active: a `0` left by a soft delete and anything a future migration invents are both refused, since
+the safe reading of a status this daemon does not recognise is "not allowed".
+
 **The blob is little-endian.** `accesos_computed` is a `blob` of `u16`s written by
 `backend/genix-orm/scylla/converter.go` with `binary.LittleEndian.PutUint16`, while every integer in
 this protocol is big-endian. Reading it the wrong way round would not fail — it would authorize the
@@ -424,7 +471,9 @@ therefore free; the work given away is one binary search over a cached list.
 backend sends `INVALIDATE_USER_ACCESS` right after rewriting the column — per user from
 `POST.users`, and once per affected user from `POST.perfiles`, which already knows exactly whose
 grants moved — so a revoked access stops working immediately. The TTL only covers a lost frame or a
-restarted backend.
+restarted backend. The opcode also accepts user `0`, the wildcard that drops every cached user of
+the company at once; both call sites today can name the users they moved, so it stands ready for a
+write that cannot.
 
 **What stays in Go.** This daemon holds no copy of `access_list.yml` and never sees an access *name*,
 which route maps to which access, or what level a method implies. All of that is `resolveRouteAccess`
