@@ -1,4 +1,4 @@
-# Genix Server Utilities
+# Auth-Limiter + Server Utils
 
 One Rust process hosting four server-side services over two transports:
 
@@ -357,46 +357,52 @@ shared frame shape, and the three operations have no field in common.
 `0x00` stays unassigned so an all-zero frame cannot route. 249 opcodes remain free; new *use
 cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
 
-`CHARGE_CREDITS` answers **two** questions in one round trip: how much this request costs, and
-whether the caller may make it. `required_access` holds packed `acceso_id << 2 | (nivel - 1)` grants
-the caller must hold at least one of, filled from index 0 with zero terminating; all four zero means
-no authorization was asked for, which is the common case. See "Access management and
-authorization" below.
+Three properties vary by opcode, and every variation is deliberate:
 
-Because the two are independent, a frame is valid with credits, with a required access, or with
-both — but not with neither. An authorize-only frame (zero credits, slots filled) is what the Go
-router sends for the routes it exempts from charging.
+| Op | Answered | Framing | Malformed payload |
+|---|---|---|---|
+| `0x01` `0x02` `0x03` `0x05` | yes | fixed width | closes the connection |
+| `0x04` `LOG_REQUEST` | **never** | `u16` length prefix | warning, connection survives |
+| `0x06` `INVALIDATE_USER_ACCESS` | **never** | fixed width | closes the connection |
 
-The high bit of the route field is `EXTRA_CREDIT_FLAG` and is not part of the route number:
-`MAX_ROUTE_ID` is fourteen bits, so the top two of those sixteen have always been dead space that
-both sides validated as zero. Set, it says the router classified this charge as a read, making it
-eligible for the extra daily pool — see "Extra credits" below. Bit 14 stays unassigned, and the
-range check both sides already run is what refuses a frame carrying it — the flag is stripped
-before the check, so anything left above fourteen bits is an error.
+`0x04` carries strings, hence the prefix; its length is inside the signed bytes, and one declaring
+more than the ceiling still closes the connection. Neither it nor `0x06` is answered — waiting on
+"the log row was stored" would put this daemon on the critical path of every request in the system,
+and the grant cache's TTL already bounds a lost invalidation — but both still advance the sequence,
+which is what the HMAC is bound to. Only `0x04` survives a decode failure: the others decide whether
+a request is admitted, and a log row is not worth taking down the charges and locks sharing that
+socket.
 
-`LOG_REQUEST` is the exception to both rules the others share. It is **length-prefixed**, because it
-carries strings, and it is **never answered**, because making a response wait for an acknowledgement
-that a log row was stored would put this daemon's latency on the critical path of every request in
-the system. The client writes the frame and returns; the sequence still advances, since that is what
-the HMAC is bound to. The length header is inside the signed bytes, and anything declaring more than
-the ceiling closes the connection — a length is an instruction from an unauthenticated peer until
-the tag at the end says otherwise.
+### The charge frame asks two independent questions
 
-`INVALIDATE_USER_ACCESS` is the second unanswered opcode, for a related reason: the grant cache's
-TTL already bounds the damage if the frame is lost, so a user save must not wait on it.
+| CPU / inference | `required_access` | What the frame is |
+|---|---|---|
+| non-zero | all zero | Charge only — no access is mapped to this route. |
+| zero | filled | Authorize only — a route the Go router exempts from charging. |
+| non-zero | filled | Both, in one round trip. |
+| zero | all zero | Refused: a frame that asks nothing. |
 
-A malformed `0x04` payload is discarded with a warning rather than closing the connection, unlike
-every other opcode. The others decide whether a request is admitted, so a frame the two sides
-disagree about is a reason to stop talking; a log row is not worth taking down the charges and
-locks sharing that socket.
+Slots fill from index 0 and zero terminates; holding **any one** of them is enough. Each holds a
+packed `acceso_id << 2 | (nivel - 1)` — see [Access management and
+authorization](#access-management-and-authorization).
 
-The HMAC covers the opcode and payload plus the connection nonce and the implicit frame sequence,
-so a frame can be replayed neither as itself nor as a different operation. Authentication,
-malformed-frame, unknown-opcode, initialization, and transport failures close the connection.
+The route field is not only a route:
 
-The domain string is bumped on every wire change — `genix-server-utils:v6` today. Replies are not
-themselves authenticated, so a version skew cannot be caught by the signature: without the bump
-an old client would keep authenticating fine and then misread a reply that grew under it.
+```
+bit  15     EXTRA_CREDIT_FLAG  the router classified this charge as a read, making it eligible
+                               for the extra daily pool — see "Extra credits"
+bit  14     unassigned         a frame carrying it is refused
+bits 13..0  route id           MAX_ROUTE_ID is fourteen bits
+```
+
+Those top two bits were always dead space both sides validated as zero, and the flag is stripped
+before the range check both sides already ran — so anything left above fourteen bits is an error.
+
+The HMAC covers the opcode and payload plus the connection nonce and the frame sequence, so a frame
+can be replayed neither as itself nor as a different operation. Authentication, malformed-frame,
+unknown-opcode, initialization and transport failures close the connection. The domain string is
+bumped on every wire change — `genix-server-utils:v6` today — because replies are not authenticated:
+without the bump an old client would authenticate fine and then misread a reply that grew under it.
 
 ### Replies are multiplexed
 
@@ -407,82 +413,91 @@ charges sent after it are answered immediately. Every reply is therefore five by
 [correlation:u16][status:u8][detail:u16]
 ```
 
-`correlation` is the low 16 bits of the request's frame sequence, echoed back. Nothing extra
-travels on the wire to carry it — the sequence already exists for the HMAC — and it is what lets
-one connection serve many callers at once. `detail` carries the lock generation on a granted
-acquire, the authorization verdict on a charge, and zero everywhere else.
+| Field | Carries |
+|---|---|
+| `correlation` | The low 16 bits of the request's frame sequence, echoed back. The sequence already exists for the HMAC, so nothing extra travels on the wire — and it is what lets one connection serve many callers at once. |
+| `status` | `0` is success for every opcode. |
+| `detail` | The lock generation on a granted acquire, the authorization verdict on a charge, `0` everywhere else. |
 
-Zero is success for every opcode. `CHARGE_CREDITS` rejections use the low five bits to identify
-the scope, time window, and exhausted credit types. Its authorization verdict travels in `detail`
-instead: `0` nothing was asked, `1` granted, `2` the user holds none of the required accesses, `3`
-no such user, `4` the user is not active. The two refusals can never both be set — authorization is
-resolved first and returns without charging — so a client reads `status` for a 429 and `detail` for
-a 403 or 401. Lock replies are `1` queue full, `2` wait
-timed out, `3` daemon at capacity, `4` protocol misuse (releasing a lock this connection does not
-hold, or presenting a superseded generation). `0xFF` means the daemon could not answer at all; it
-is deliberately not a valid verdict for any opcode. Credit charges and budget mutations fail
-closed; call sites for locks retain their operation-specific policy.
+`status` on a refusal:
 
-The client must assign a sequence and write its frame atomically. Two callers taking 5 and 6 but
-writing 6, 5 would desynchronize the HMAC and every later frame would fail.
+| Opcode | Value | Meaning |
+|---|---|---|
+| `CHARGE_CREDITS` | low 5 bits | The scope, time window and exhausted credit types of the violation. |
+| `LOCK_*` | `1` | Queue full. |
+| `LOCK_*` | `2` | Wait timed out. |
+| `LOCK_*` | `3` | Daemon at capacity. |
+| `LOCK_*` | `4` | Protocol misuse — releasing a lock this connection does not hold, or a superseded generation. |
+| any | `0xFF` | The daemon could not answer at all. Deliberately not a valid verdict for any opcode. |
+
+`detail` on a charge is the authorization verdict, and the HTTP answer Go turns it into:
+
+| Value | Verdict | Go |
+|---|---|---|
+| `0` | Nothing was asked | — |
+| `1` | Granted | — |
+| `2` | Holds none of the required accesses | 403 |
+| `3` | No such user in this company | 401 |
+| `4` | The user is not active | 401 |
+
+A 429 and a 403 can never both be set — authorization resolves first and returns without charging —
+so a client reads `status` for the credit answer and `detail` for the access one. Credit charges and
+budget mutations fail closed; lock call sites keep their operation-specific policy. The client must
+assign a sequence and write its frame atomically: two callers taking 5 and 6 but writing 6, 5 would
+desynchronize the HMAC and every later frame would fail.
 
 ## Access management and authorization
 
-The charge frame also answers "may this user do this", and that is the second reason it exists.
+The charge frame's other question. Grants are cached here because this is the only always-resident
+process: on Lambda every execution environment starts empty and a large share of requests are
+somebody's first, so caching there would pay a ScyllaDB round trip on the authorization path before
+the handler runs. The frame was going out regardless.
 
-The grants are cached here because this is the only process that is always resident. The backend
-cannot cache them usefully: on Lambda every new execution environment starts empty, and at any scale
-a large share of requests are somebody's first, so an in-process cache there would pay a full
-ScyllaDB round trip on the authorization path before the handler does anything. The frame was going
-out regardless, so the question rides on it.
+**A grant is one `u16`**, and the level lives in the low two bits:
 
-**What is cached.** Per `(company, user)`: the sorted packed grants, `users.status`, and whether the
-row exists at all. Two bytes per grant — a user holding every access in today's catalogue costs 68
-bytes, less than the `HashMap` entry around it. It lives in the same shard, behind the same mutex and
-on the same key as the quota state, so a request that both authorizes and charges takes one lock.
+```
+bits 15..2  acceso_id
+bits  1..0  nivel - 1    nivel is 1..4; a read needs 1, a write 2
+```
 
-**What a grant means.** One `u16`, `acceso_id << 2 | (nivel - 1)`: the access id in the high bits,
-a four-value level in the low two. A required grant is satisfied by any level **at or above** it
-inside the same id — a binary search for the exact value, then one look at the next element to see
-whether it is still under that id's ceiling (`required | 0b11`). A frame carries up to four required
-grants and holding **any one** of them is enough, which is what a route mapped to several accesses
-has always meant. This is `hasPackedAccesoInRange` from `backend/core/responses.go`, ported
-deliberately unchanged: the same algorithm over the same representation is what keeps the two
-processes from drifting into disagreeing about what a grant means.
+A required grant is satisfied by any level **at or above** it inside the same id: binary search for
+the exact value, then one look at the next element to see whether it is still under that id's ceiling
+(`required | 0b11`). This is `hasPackedAccesoInRange` from `backend/core/responses.go`, ported
+unchanged, so the two processes cannot drift into disagreeing about what a grant means.
 
-**Identity first, permission second.** The verdict resolves in that order — no such user, then
-inactive user, then grants — because the three become different HTTP answers on the Go side, and
-collapsing them would tell a user this company no longer has that it merely lacks permission. A
-token whose HMAC checked out but whose `(company, user)` has no row is a 401, `users.status != 1` is
-a 401, and holding none of the required accesses is a 403. Status `1` is the only value that means
-active: a `0` left by a soft delete and anything a future migration invents are both refused, since
-the safe reading of a status this daemon does not recognise is "not allowed".
-
-**The blob is little-endian.** `accesos_computed` is a `blob` of `u16`s written by
-`backend/genix-orm/scylla/converter.go` with `binary.LittleEndian.PutUint16`, while every integer in
-this protocol is big-endian. Reading it the wrong way round would not fail — it would authorize the
-wrong things.
-
-**Refusal precedes charging.** The verdict is resolved before any quota work, and a refusal returns
-without touching usage, without allocating quota state, and without loading the budget. A 403 is
-therefore free; the work given away is one binary search over a cached list.
-
-**Freshness.** `rate_limit.access_cache_seconds` (default 600) is a backstop, not the mechanism. The
-backend sends `INVALIDATE_USER_ACCESS` right after rewriting the column — per user from
-`POST.users`, and once per affected user from `POST.perfiles`, which already knows exactly whose
-grants moved — so a revoked access stops working immediately. The TTL only covers a lost frame or a
-restarted backend. The opcode also accepts user `0`, the wildcard that drops every cached user of
-the company at once; both call sites today can name the users they moved, so it stands ready for a
-write that cannot.
+- **What is cached.** Per `(company, user)`: the sorted grants, `users.status`, and whether the row
+  exists at all. Two bytes per grant, so a user holding every access in today's catalogue costs 68
+  bytes. It sits in the same shard, mutex and key as the quota state, so a request that both
+  authorizes and charges takes one lock.
+- **Identity before permission.** The verdict resolves in that order — no such user, then
+  `status != 1`, then grants — because the three become different HTTP answers, and collapsing them
+  would tell a user this company no longer has that it merely lacks permission. `1` is the only
+  value that means active: a `0` from a soft delete and anything a future migration invents are both
+  refused.
+- **Refusal precedes charging.** A refusal touches no usage, allocates no quota state and loads no
+  budget. A 403 is free; the work given away is one binary search.
+- **The blob is little-endian.** `accesos_computed` is written by
+  `backend/genix-orm/scylla/converter.go` with `binary.LittleEndian.PutUint16`, while every integer
+  in this protocol is big-endian. Reading it the wrong way round would not fail — it would authorize
+  the wrong things.
+- **Freshness.** `rate_limit.access_cache_seconds` (default 600) is a backstop, not the mechanism.
+  `INVALIDATE_USER_ACCESS` is sent right after the column is rewritten — per user from `POST.users`,
+  once per affected user from `POST.perfiles` — so a revoked access stops working immediately; the
+  TTL only covers a lost frame or a restarted backend. User `0` is the wildcard, for a write that
+  cannot name them.
 
 **What stays in Go.** This daemon holds no copy of `access_list.yml` and never sees an access *name*,
-which route maps to which access, or what level a method implies. All of that is `resolveRouteAccess`
-in `backend/main-handlers.go`, and every rule that means "do not ask" produces an empty slot list
-there: an unmapped `GET` is free to any session, `POST.user-self` needs a session and no access, and
-**user 1 is never sent** — `login.go` synthesizes its full grant list in the login response and never
-persists it, so its stored blob is empty and this daemon would deny it. A mapped route with no
-accesses at all is refused in Go without a frame, because the catalogue denies by default and an
-empty slot list would have meant the opposite.
+which route maps to which access, or what level a method implies. That is all `resolveRouteAccess` in
+`backend/main-handlers.go`, where every rule meaning "do not ask" produces an empty slot list rather
+than a special case here:
+
+| Case | What the router does |
+|---|---|
+| Unmapped `GET` | Frame with no slots — free to any session. |
+| `POST.user-self` | Frame with no slots — needs a session, no access. |
+| User 1 | Frame with no slots. `login.go` synthesizes its grant list in the login response and never persists it, so its stored blob is empty and this daemon would deny it. It cannot be asked. |
+| Mapped route with no accesses | Refused in Go, no frame — the catalogue denies by default, and an empty slot list would have meant the opposite. |
+| Route mapped to more than four accesses | Refused in Go with a 500 — truncating would authorize against fewer accesses than the route declares. |
 
 ## Extra credits
 
@@ -491,98 +506,85 @@ its normal quota has already refused, and only on a frame marked as a read. It i
 between a tenant out of credit seeing a 429 everywhere and one that can still look at its data.
 Zero — the default — removes the feature entirely.
 
-**Reads only, and the daemon does not decide which.** Eligibility rides in the frame, derived on the
-Go side inside `ChargeAPIUsage` from the same string that chose the tariff, so a write cannot be
-marked by a caller disagreeing with itself. A marked frame that also asks for inference credits is
-not relaxed in any dimension: the pool is a single CPU figure and has nothing that could authorize
-one.
+```
+charge
+  ├─ burst gates: 10s buckets, hourly ceilings ──refuse──→ 429
+  │      pass       never bypassed: a pooled charge still spends burst tokens and hour_used
+  ├─ entitlement: company daily, user daily, monthly ──pass──→ charged to day_used
+  │      refuse     this, and only this, is what the pool bypasses
+  ├─ read-marked frame, and the pool covers the charge? ──no──→ that same 429, unchanged
+  │      yes
+  └─ charged to day_extra_cpu_used, never to day_used or month_used
+```
 
-**The burst gates are never relaxed.** The 10-second buckets and the hourly ceilings protect the
-machine, and a flood of reads is precisely what they protect it from, so a charge paid out of the
-pool still consumes burst tokens and still counts against `hour_used`. Skipping them would hand a
-company in read-only mode unlimited burst. What the pool bypasses is the *entitlement*: the daily
-company gate, the daily user gate, and the monthly ceiling.
-
-**The pool is consulted last.** A read that fits inside the entitlement is charged against it. Only
-once one of the three entitlement gates refuses is the pool asked, and if it cannot cover the charge
-the original violation is returned unchanged — the client sees exactly the 429 it would have seen.
-
-**No per-user share.** The pool belongs to the company and one user can drain it. Halving it the way
-the daily user gate is halved would leave a single-user company — most of them — unable to reach it
-at all, and the burst gates already bound the rate.
-
-**Counted apart.** Extra spending never touches `day_used` or `month_used`, so `daily - day_used`
-keeps meaning what a write is judged against and the monthly ceiling that was paid for never moves.
-It lands in `company_credit_budget.day_extra_cpu_used` instead, keyed by the same
-`usage_day_period` as the other counters.
-
-`month_extra_cpu_used` is *not* a second ceiling — there is no monthly extra limit. It is the
-correction term `ensure_budget` subtracts when it rebuilds `month_used` by summing the month's usage
-rows, because a request served from the pool is still a request that was served and still lands in
-those rows. Without it, every restart would quietly shrink the entitlement by whatever the pool had
-paid for.
-
-Nothing about the reply frame changes: a request served from the pool is answered exactly like one
-served from quota, and the client cannot tell. The daemon logs it at `info` — that line is the only
-outward sign a tenant is in read-only mode.
+- **Reads only, and the daemon does not decide which.** Eligibility rides in the frame, derived on
+  the Go side inside `ChargeAPIUsage` from the same string that chose the tariff, so a write cannot
+  be marked by a caller disagreeing with itself. A marked frame that also asks for inference is
+  not relaxed in any dimension: the pool is a single CPU figure.
+- **The burst gates are never relaxed.** A flood of reads is what they protect the machine from, so
+  skipping them would hand a company in read-only mode unlimited burst.
+- **No per-user share.** One user can drain it. Halving it the way the daily user gate is halved
+  would leave a single-user company — most of them — unable to reach it at all, and the burst gates
+  already bound the rate.
+- **Counted apart.** It lands in `company_credit_budget.day_extra_cpu_used`, keyed by the same
+  `usage_day_period` as the other counters, so `daily - day_used` keeps meaning what a write is
+  judged against and the monthly ceiling never moves.
+- **`month_extra_cpu_used` is not a second ceiling** — there is no monthly extra limit. It is the
+  correction `ensure_budget` subtracts when it rebuilds `month_used` from the month's usage rows,
+  because a pooled request still landed in them. Without it every restart would quietly shrink the
+  entitlement by whatever the pool had paid for.
+- **Invisible on the wire.** A pooled request is answered exactly like a quota one; the client cannot
+  tell. The daemon logs it at `info` — the only outward sign a tenant is in read-only mode.
 
 ## Lock behavior
 
 One holder per `(action, identifier)` — every lock is mutual exclusion. The daemon interprets
-neither field: the Go call sites decide what is being serialized (a client IP, a company, a
-packed pair), which is what makes one service cover every case in the project.
+neither field: the Go call sites decide what is being serialized (a client IP, a company, a packed
+pair), which is what makes one service cover every case in the project.
 
-**Ownership is bound to the connection.** The permit lives in the connection task, so a
-disconnect, a crash and a killed Lambda all free the lock at once — no sweeper, and no waiting
-out a lease. One connection may hold several keys, and losing it frees all of them.
+- **Ownership is bound to the connection.** The permit lives in the connection task, so a
+  disconnect, a crash and a killed Lambda all free the lock at once — no sweeper, no waiting out a
+  lease. One connection may hold several keys, and losing it frees all of them.
+- **The lease is an absolute deadline**, stamped at grant and checked by the reader: the backstop
+  for a holder that stays connected but wedged. Deliberately not the socket's read timeout — with
+  charges and locks sharing one connection, arriving traffic would push that forward forever.
+  Expiry drops that one lock and leaves the connection running, since killing it would take every
+  other lock with it. While a connection holds anything the idle timeout does not apply: a caller
+  holding a 30 s lease is quiet, not dead.
+- **Each grant carries a generation**, returned in the reply's `detail` and required by the release.
+  Without it, a release from a caller that already gave up would end whichever hold replaced it on
+  that key — a real risk now that several callers share one connection. The counter is registry-wide
+  because an idle key's entry is pruned, and a per-key counter would restart at zero and match the
+  stale release exactly.
+- **Two ceilings, one at each end.** `max_waiters` is checked before queueing, because with an
+  unbounded queue the wait itself becomes the denial of service;
+  `rate_limit.max_inflight_per_connection` bounds the other direction, since multiplexing removed
+  the backpressure one-request-per-socket used to provide for free.
 
-**The lease is an absolute deadline**, stamped when the lock is granted and checked by the
-reader. It is the backstop for a holder that stays connected but wedged. It is not the socket's
-read timeout: with charges and locks sharing one connection, arriving traffic would push that
-forward forever and a wedged holder would keep its key. Expiry drops that one lock and leaves the
-connection running, because killing it would take every other lock and every pending request with
-it. While a connection holds anything, the idle timeout does not apply — a caller legitimately
-holding a 30s lease is quiet, not dead.
-
-**Each grant carries a generation**, returned in the reply's `detail` and required by the
-release. Without it, a release from a caller that already gave up would end whichever hold
-replaced it on that key — a real risk now that several callers share one connection. The counter
-is registry-wide rather than per-key: an idle key's entry is pruned, so a per-key counter would
-restart at zero and the stale release would match exactly.
-
-`max_waiters` is checked before queueing: past the ceiling a caller is refused immediately rather
-than parked, because with an unbounded queue the wait itself becomes the denial of service.
-`rate_limit.max_inflight_per_connection` bounds the other direction — multiplexing removed the
-backpressure that one-request-per-socket used to provide for free.
-
-Locks are in-memory: a restart drops all of them, and two daemon instances would hand the same
-key to two holders. Single active process, same as the limiter.
-
-A lock orders callers; it does not make them safe. A partition can free a key while its holder is
-still working, which is true of every liveness-based lock, so work inside one must remain safe to
-run twice.
+Locks are in-memory: a restart drops all of them, and two daemon instances would hand the same key
+to two holders. Single active process, same as the limiter. And a lock orders callers; it does not
+make them safe — a partition can free a key while its holder still works, so work inside one must
+remain safe to run twice.
 
 ## Request log behavior
 
-- One row per finished request in `user_logs`, batched into unlogged batches every `flush_ms` or
-  at `max_batch`, whichever comes first.
-- One row per distinct failing code line in `request_errors`. The code line is the identity, not
-  the message: two failures at `responses.go:539` are the same error however differently they
-  phrase themselves, which is what keeps that table bounded by the codebase instead of by traffic.
-- A code line written under `error_cache_seconds` ago is not written again. Ten minutes of
-  staleness on the preview costs nothing, because the current message is already in CloudWatch
-  under the request id that referenced it.
-- `user_logs` rows are written `USING TTL ttl_days`. The partition is the date, so a whole day
-  expires together and Scylla drops it wholesale. `request_errors` has no TTL — a code line that
-  failed once is worth keeping until it is rewritten.
-- **Fails open, everywhere.** A full queue drops the record and counts it; a failed write logs a
-  warning and drops the batch; statements that cannot be prepared at startup disable the writer and
-  leave the process running. None of it propagates, because a log row is never worth stopping the
-  limiter and the bridge for.
+| Table | One row per | Retention |
+|---|---|---|
+| `user_logs` | Finished request, in unlogged batches every `flush_ms` or at `max_batch`, whichever comes first. | `USING TTL ttl_days`. The partition is the date, so a whole day expires together and Scylla drops it wholesale. |
+| `request_errors` | Distinct failing **code line**, at most once per `error_cache_seconds`. | None — a code line that failed once is worth keeping until it is rewritten. |
 
-The dashboard reads through one index: `frame_route_company_agg`, packed frame-major so a
-fifteen-minute slice of a day is a single contiguous clustering range and a poll reads forward
-instead of rereading the day.
+The code line is the identity, not the message: two failures at `responses.go:539` are the same
+error however differently they phrase themselves, which keeps that table bounded by the codebase
+instead of by traffic. The staleness costs nothing — the current message is already in CloudWatch
+under the request id that referenced it.
+
+**Fails open, everywhere.** A full queue drops the record and counts it; a failed write warns and
+drops the batch; statements that cannot be prepared at startup disable the writer and leave the
+process running. A log row is never worth stopping the limiter and the bridge for.
+
+The dashboard reads through one index, `frame_route_company_agg`, packed frame-major so a
+fifteen-minute slice of a day is one contiguous clustering range and a poll reads forward instead of
+rereading the day:
 
 ```
 bits 47..40  frame      0..95, four per hour
@@ -590,91 +592,83 @@ bits 39..24  route_id   the generated number, backend/core/api_routes.generated.
 bits 23..0   company_id
 ```
 
-The packing is written twice — `src/reqlog/protocol.rs` writes the column and
-`backend/core/types/user_logs.go` ranges over it — and the vectors in both test files pin them
-together. A drift there produces rows that look right and a chart that is quietly wrong.
+It is written twice — `src/reqlog/protocol.rs` writes the column, `backend/core/types/user_logs.go`
+ranges over it — and the vectors in both test files pin them together. A drift there produces rows
+that look right and a chart that is quietly wrong.
 
 ## Server metrics behavior
 
 The one part of this daemon nothing calls into: it just ticks. Design in
 [PLAN_SERVER_METRICS.md](PLAN_SERVER_METRICS.md), schema in
-`backend/core/types/server_metrics.go`.
+`backend/core/types/server_metrics.go`. One row every `row_seconds` in `server_metrics`, partitioned
+by unix day and clustered by the slot within it (`secondsIntoDay / 5`, so 0..17279 and comfortably
+inside the int16 key).
 
-- One row every `row_seconds` in `server_metrics`, partitioned by unix day and clustered by the
-  slot within it (`secondsIntoDay / 5`, so 0..17279 and comfortably inside the int16 key).
+| Columns | Unit | Range it has to cover |
+|---|---|---|
+| CPU | Hundredths of a percent **of the whole machine** | Scylla pinning eight of eight cores reads 100.00%, not the top-style 800% that would not fit the column. |
+| Memory | Megabytes | Saturates at 32 GB. |
+| Network | 5 KB/s units | Reaches 163 MB/s while still resolving the single-digit KB/s an idle box shows. |
+| any | `-1` | **Not measured**, and the whole answer to the Lambda case: with no `genix.service` on the machine the backend's columns carry the sentinel rather than a `0` that would read as an idle backend. |
+
 - **Every value is a peak, not an average.** Sampling runs at `sample_seconds` and the row carries
   the highest of the five sub-samples, so a one-second spike survives into a five-second row. The
-  price is that these rows cannot be summed: adding `net_rx_rate` across a day overstates the bytes
-  actually transferred, because each value is a peak standing in for five seconds.
-- Per-service memory and CPU come from the unit's cgroup — `memory.stat`'s `anon + file_mapped`
-  (which reconstructs `VmRSS`: anonymous pages plus mapped file pages, with cold page cache left
-  out) and `cpu.stat`'s `usage_usec`. One read covers a multi-process service correctly, and a
-  missing directory is exactly the "not on this box" signal.
-- The unit's cgroup directory is **searched for** under `/sys/fs/cgroup`, never assumed to be under
-  `system.slice` — Scylla's packaging puts it at
-  `scylla.slice/scylla-server.slice/scylla-server.service`. Resolved once and cached; a failed
-  search retries every 30 s, so an absent unit costs nothing and one that starts later is picked up.
-- **`-1` means not measured**, and it is the whole answer to the Lambda case: with no
-  `genix.service` on the machine, the backend's two columns carry the sentinel rather than a `0`
-  that would read as an idle backend. It survives to the row only when no sub-sample of the window
-  produced a value.
-- CPU is a percentage of the **whole machine**, so Scylla pinning eight of eight cores reads
-  100.00% and not the top-style 800% that would not fit the column. Percentages are hundredths;
-  memory is megabytes saturating at 32 GB; network is 5 KB/s units, which reaches 163 MB/s while
-  still resolving the single-digit KB/s an idle box shows.
-- Rows land on a wall-clock grid, not on a tick counter, so a restart resumes the same slots and a
-  skipped tick leaves an honest hole instead of shifting every later row.
-- **Fails open**, like the request log: a failed write is a warning. The insert is prepared lazily
-  and retried every 60 s while it fails, so a daemon that starts before `fn-homologate` created the
-  table heals itself instead of needing a restart.
+  price is that these rows cannot be summed: each value is a peak standing in for five seconds, so
+  adding `net_rx_rate` across a day overstates the bytes transferred. `-1` likewise reaches the row
+  only when no sub-sample of the window produced a value.
+- **Per-service memory and CPU come from the unit's cgroup** — `memory.stat`'s `anon + file_mapped`
+  (which reconstructs `VmRSS`: anonymous plus mapped file pages, cold page cache left out) and
+  `cpu.stat`'s `usage_usec`. One read covers a multi-process service, and a missing directory is
+  exactly the "not on this box" signal. The directory is **searched for** under `/sys/fs/cgroup`,
+  never assumed to be under `system.slice` — Scylla's packaging puts it at
+  `scylla.slice/scylla-server.slice/scylla-server.service`. Resolved once and cached, retrying every
+  30 s while it fails, so one that starts later is picked up.
+- **Rows land on a wall-clock grid**, not on a tick counter, so a restart resumes the same slots and
+  a skipped tick leaves an honest hole instead of shifting every later row.
+- **Fails open**, like the request log. The insert is prepared lazily and retried every 60 s, so a
+  daemon that starts before `fn-homologate` created the table heals itself.
 
 ## Deploying
 
-`sudo python3 scripts/configure.py 37` compiles the binary, installs the systemd units,
-and writes the bridge's Nginx vhost (HTTP/3 when a certificate exists and Nginx was built with
-it) on this host. It asks nothing — everything comes from `config.toml`. It installs a C compiler
-if the host has none, and after starting the service it probes `/health` rather than trusting
-`systemctl restart`: this daemon exits when ScyllaDB is unreachable, and with `Restart=always`
-that would otherwise look identical to a healthy start. Full details, including the generated
-unit and the three non-negotiable Nginx streaming settings, are in
+`sudo python3 scripts/configure.py 37` compiles the binary, installs the systemd units, and writes
+the bridge's Nginx vhost (HTTP/3 when a certificate exists and Nginx was built with it). It asks
+nothing — everything comes from `config.toml` — and installs a C compiler if the host has none.
+After starting the service it probes `/health` rather than trusting `systemctl restart`: this daemon
+exits when ScyllaDB is unreachable, which with `Restart=always` looks identical to a healthy start.
+The generated unit and the three non-negotiable Nginx streaming settings are in
 [`../scripts/configure/CONFIGURE_SERVER_UTILS.md`](../scripts/configure/CONFIGURE_SERVER_UTILS.md).
 
 For a self-hosted backend, select both components (`237` or `238`) and choose Backend mode `1` or
-`2`. The dispatcher installs this daemon without its public SSE Nginx vhost and does not require
-`sse_bridge.url`; the backend process already serves `/agent/stream`.
+`2`: the dispatcher then installs this daemon without its public SSE Nginx vhost and does not
+require `sse_bridge.url`, since the backend already serves `/agent/stream`.
 
-The raw TCP listener should remain on loopback or a private network. HMAC authenticates messages,
-but the protocol does not encrypt traffic. The bridge's HTTP port speaks plain HTTP; Nginx
-terminates TLS in front of it.
+Keep the raw TCP listener on loopback or a private network. HMAC authenticates messages but does not
+encrypt them, and the bridge's HTTP port speaks plain HTTP with Nginx terminating TLS in front.
 
 ## Go charging rules
 
-The backend uses uncompressed bytes and binary KiB (`1 KiB = 1024 bytes`):
+Sizes are uncompressed bytes in binary KiB (`1 KiB = 1024 bytes`), and the group boundaries are the
+same for both methods:
 
-- GET groups `0/1/2` use response sizes `<32 KiB`, `32..256 KiB`, and `>256 KiB`.
-- POST groups `3/4/5` use request-body sizes with the same boundaries. `PUT` is a write like `POST`
-  and shares every rule below with it — same tariff, same required access level. The two are one
-  behaviour, declared once (`isWriteMethod` in the router, one `case "POST", "PUT"` in the tariff).
-- GET CPU usage is two base credits for the first 8 KiB, then one credit per started 16 KiB.
-- POST/PUT CPU usage is five base credits for the first 8 KiB, then one credit per started 8 KiB.
-- Successful inference usage is one credit per started 8 KiB of provider input and two credits per
-  started 8 KiB of provider output.
+| Method | Groups | Sized by | CPU for the first 8 KiB | CPU beyond it |
+|---|---|---|---|---|
+| `GET` | `0/1/2` | response bytes: `<32`, `32..256`, `>256` KiB | 2 credits | 1 per started 16 KiB |
+| `POST` / `PUT` | `3/4/5` | request-body bytes, same boundaries | 5 credits | 1 per started 8 KiB |
 
-Authenticated private writes (`POST`, `PUT`) are admitted before their handler runs, in one frame
-that also authorizes them.
+Inference has no base and is charged only on success: one credit per started 8 KiB of provider
+input, two per started 8 KiB of provider output. `PUT` is a write like `POST` — same tariff, same
+required access level, declared once (`isWriteMethod` in the router, one `case "POST", "PUT"` in
+the tariff).
 
-A GET is split, because its byte count only exists after the handler while its authorization verdict
-is needed before it. The pre-handler frame carries the access check and the **base** charge of two
-credits; a **top-up** frame follows only when the response exceeded the first 8 KiB, which is the
-only case that costs more than the base. Most GETs therefore send one frame and no top-up. Two
-consequences worth knowing when reading the usage tables: a GET that ends in an error still costs its
-two base credits, and a streamed response is charged its base and never topped up.
+How many frames a request sends:
 
-A method with no tariff at all — anything that is neither a read nor a write — is authorized and not
-charged, rather than becoming a 503: the tariff errors on a method it does not know, and the router
-fails closed on an error.
+| Request | Frames |
+|---|---|
+| `POST` / `PUT` | One, before the handler runs: it authorizes and charges together. |
+| `GET` | A pre-handler frame with the access check and the **base** two credits, then a **top-up** only if the response exceeded the first 8 KiB. Most GETs send one frame and no top-up. |
+| A method with no tariff | Authorize-only. Not a 503: the tariff errors on a method it does not know, and the router fails closed on an error. |
+| A route exempt from charging | Authorize-only, zero credits. The credit panel's own reads, so a tenant out of credit can still see why — and three of them are access-mapped, two SaaS-only, so skipping the *frame* would leave them open to any session. |
 
-Routes exempt from charging (the credit panel's own reads, so a tenant out of credit can still see
-why) skip the **credits**, never the **frame**: three of them are access-mapped and two are
-SaaS-only, so skipping the frame would leave them open to any session. They send an authorize-only
-frame with zero credits.
+The GET is split because its byte count only exists after the handler while its verdict is needed
+before it. Two consequences when reading the usage tables: a GET that ends in an error still costs
+its two base credits, and a streamed response is charged its base and never topped up.
