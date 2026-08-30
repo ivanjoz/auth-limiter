@@ -1,0 +1,5 @@
+# Cargo build output.
+/target/
+
+# Binario compilado de vectors/, la herramienta Go que genera los vectores de prueba.
+/vectors/vectors
