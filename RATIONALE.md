@@ -1,3 +1,25 @@
+## This repository builds and publishes its own release binaries
+
+**Context** — The crate lived here but nothing here built it. `genix`'s
+`release-binaries.yml` compiled both architectures, and its `plan`/`reuse` jobs existed only to
+work around the mismatch: a `genix` tag usually means the backend changed and this crate did not,
+so the workflow diffed the recorded gitlink and re-downloaded the previous tag's assets to avoid
+starting two Rust runners for an unchanged crate. A repository that ships a binary could not
+produce that binary on its own.
+
+**Decision** — `.github/workflows/release-binaries.yml` here builds `auth-limiter_linux_amd64` and
+`auth-limiter_linux_arm64` on `push` of a `v*` tag (plus `workflow_dispatch` for validation), and
+publishes them with a `SHA256SUMS` manifest as a release of this repository. Two native runners,
+`ubuntu-24.04` and `ubuntu-24.04-arm`, so `cargo test` runs on the architecture it ships for
+instead of only cross-compiling for it. `genix` deleted its three auth-limiter jobs and its
+deployer now fetches these assets from here.
+
+**Rationale** — The reuse machinery becomes unnecessary rather than merely simpler: in this
+repository a `v*` tag exists only because this crate changed, so there is never an unchanged build
+to skip. The costs are real and accepted: releasing is now two tags instead of one, and a host that
+takes the backend and the daemon together resolves two `latest` releases that no single tag pins
+to each other. The wire protocol is what actually constrains that pairing, and it has its own
+version in the HMAC domain — see the rename entry below.
 ## The crate, the config section and the systemd units all take the auth-limiter name
 
 **Context** — This code moved into its own repository, `github.com/ivanjoz/auth-limiter`, but every

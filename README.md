@@ -252,10 +252,11 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-Every versioned [Genix GitHub Release](https://github.com/ivanjoz/genix/releases) also publishes
-these static outputs as `auth-limiter_linux_amd64` and
-`auth-limiter_linux_arm64`. Downloading `latest` is convenient for a manual install; replace
-`latest/download` with `download/vX.Y.Z` to pin production automation to an immutable release.
+Every versioned [GitHub Release of this repository](https://github.com/ivanjoz/auth-limiter/releases)
+publishes these static outputs as `auth-limiter_linux_amd64` and `auth-limiter_linux_arm64`, built
+by `.github/workflows/release-binaries.yml` on a native runner per architecture. Downloading
+`latest` is convenient for a manual install; replace `latest/download` with `download/vX.Y.Z` to
+pin production automation to an immutable release.
 
 ```bash
 # Map the Linux machine name to the release asset suffix.
@@ -266,7 +267,7 @@ case "$(uname -m)" in
 esac
 
 # Download the public binary and the manifest without requiring a GitHub token.
-release_base_url=https://github.com/ivanjoz/genix/releases/latest/download
+release_base_url=https://github.com/ivanjoz/auth-limiter/releases/latest/download
 release_asset="auth-limiter_linux_${release_architecture}"
 curl --fail --location --output "$release_asset" "${release_base_url}/${release_asset}"
 curl --fail --location --output SHA256SUMS "${release_base_url}/SHA256SUMS"

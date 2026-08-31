@@ -3,3 +3,6 @@
 
 # Binario compilado de vectors/, la herramienta Go que genera los vectores de prueba.
 /vectors/vectors
+
+# Release staging directory used by .github/workflows/release-binaries.yml.
+/dist/
