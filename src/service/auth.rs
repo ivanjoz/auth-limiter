@@ -20,6 +20,8 @@ use thiserror::Error;
 /// Replies are not themselves authenticated, so without the bump an old client would keep
 /// authenticating fine, read 1 byte of a 5-byte reply, and silently misinterpret everything
 /// after that.
+/// The value kept its pre-rename spelling on purpose: it identifies the protocol, not the crate,
+/// so a rename must not consume a version bump or invalidate frames a deployed backend still signs.
 const DOMAIN: &[u8] = b"genix-server-utils:v6";
 
 type HmacSha256 = Hmac<Sha256>;

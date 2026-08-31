@@ -8,7 +8,7 @@
 // backend's module graph, and it prints rather than writes, because the vectors
 // are a handful of constants that belong next to the assertions that use them.
 //
-//	go run ./server_utils/vectors
+//	go run ./vectors
 package main
 
 import (

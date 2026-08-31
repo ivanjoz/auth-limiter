@@ -44,7 +44,7 @@ implies. It answers "does this user hold any of these four packed grants".
 ## 2. Who talks to whom
 
 ```
-browser              backend (Go, Lambda or VPS)            server-utils (Rust daemon)
+browser              backend (Go, Lambda or VPS)            auth-limiter (Rust daemon)
    │                          │                                       │
    │── GET api/productos ────▶│                                       │
    │                          │  CheckUser: token only, no DB         │
@@ -432,16 +432,16 @@ use.
 | Concern | File |
 |---|---|
 | The gate, the catalogue, the tariff | `backend/main-handlers.go` — `enforceAccessAndCredits`, `resolveRouteAccess`, `chargedMethodFor`, `chargeGetResponseTopUp` |
-| Frame encoding, tariff arithmetic, reply decoding | `backend/core/server_utils/credits.go` |
-| Access invalidation (`0x06`) | `backend/core/server_utils/access_invalidation.go`, called from `backend/security/shared.go` |
+| Frame encoding, tariff arithmetic, reply decoding | `backend/core/auth_limiter/credits.go` |
+| Access invalidation (`0x06`) | `backend/core/auth_limiter/access_invalidation.go`, called from `backend/security/shared.go` |
 | Packed grant construction | `backend/core/responses.go` — `MakeAccesoNivelPacked` |
-| Wire codec | `server_utils/src/limiter/protocol.rs` |
-| Grant cache, codec, verdict | `server_utils/src/limiter/access.rs` |
-| The decision and every counter | `server_utils/src/limiter/quota.rs` — `admit_at` |
-| Blob encoding | `server_utils/src/limiter/credits_blob.rs` |
-| Time frames and the UTC-5 offset | `server_utils/src/limiter/time_frame.rs` |
-| ScyllaDB statements | `server_utils/src/limiter/storage.rs` |
-| Opcode dispatch, reply construction | `server_utils/src/service/server.rs`, `protocol.rs`, `auth.rs` |
+| Wire codec | `auth_limiter/src/limiter/protocol.rs` |
+| Grant cache, codec, verdict | `auth_limiter/src/limiter/access.rs` |
+| The decision and every counter | `auth_limiter/src/limiter/quota.rs` — `admit_at` |
+| Blob encoding | `auth_limiter/src/limiter/credits_blob.rs` |
+| Time frames and the UTC-5 offset | `auth_limiter/src/limiter/time_frame.rs` |
+| ScyllaDB statements | `auth_limiter/src/limiter/storage.rs` |
+| Opcode dispatch, reply construction | `auth_limiter/src/service/server.rs`, `protocol.rs`, `auth.rs` |
 | Panel reporting | `backend/config/company_credit_usage.go`, `company_credit_budget.go` |
 
 ### The tests that hold the contracts

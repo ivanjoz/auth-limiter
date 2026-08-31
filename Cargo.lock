@@ -59,6 +59,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "auth-limiter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "colbin",
+ "getrandom 0.4.3",
+ "hmac",
+ "libc",
+ "scylla",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -423,32 +449,6 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
-]
-
-[[package]]
-name = "genix-server-utils"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "colbin",
- "getrandom 0.4.3",
- "hmac",
- "libc",
- "scylla",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror",
- "tokio",
- "tokio-stream",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,3 +1,29 @@
+## The crate, the config section and the systemd units all take the auth-limiter name
+
+**Context** — This code moved into its own repository, `github.com/ivanjoz/auth-limiter`, but every
+name it exposed still said `server_utils`: the crate was `genix-server-utils`, the daemon read a
+`[server_utils]` TOML section, its env overrides were `SERVER_UTILS_*`, and it installed
+`genix-server-utils.service`. One component answered to two names depending on which surface you
+looked at.
+
+**Decision** — Everything renamed to `auth-limiter` / `auth_limiter`: crate and binary, the TOML
+section and its keys, the `AUTH_LIMITER_*` env vars, the `RUST_LOG` target, the systemd unit
+triplet, and the release assets (`auth-limiter_linux_{amd64,arm64}`). Two things were deliberately
+**not** renamed:
+
+- `DOMAIN = b"genix-server-utils:v6"` in `src/service/auth.rs`. It is an HMAC domain-separation
+  string mirrored byte for byte in `backend/core/auth_limiter/connection.go`. Its value is a
+  protocol identifier, not a name — changing it invalidates every frame and demands a lockstep
+  deploy of backend and daemon. The `:v6` suffix is the versioning channel for that; a rename is
+  not a wire change and must not consume a version bump.
+- The `server_utils_mem_mb` / `server_utils_cpu_percent` columns in `src/sysmetrics/writer.rs`.
+  Those are live Scylla column names with rows already written against them.
+
+**Rationale** — A single name makes the daemon greppable across four languages. The cost is a
+breaking deploy: an installed host keeps running the old `genix-server-utils.service` until
+`configure_auth_limiter.py` is re-run, and any `config.toml` with a `[server_utils]` section stops
+being read. That was accepted deliberately for a pre-alpha project rather than carrying an alias.
+
 ## Decode the session token with the colbin crate instead of transcribing the format
 
 **Context** — `src/bridge/token.rs` hand-wrote a colbin decoder: 577 lines mirroring the format's
@@ -17,7 +43,7 @@ genuinely this bridge's: `UserToken`, the five-field layout and the ids it impli
 `decode_session_token` over `colbin::decode_one`, `decode_session_base64`, and the channel token,
 which is a separate custom format and is untouched. 577 lines down to 416, of which the channel
 token and its cross-language vectors are the larger half; `TokenError`'s four colbin-internal
-variants collapse into one `#[from] colbin::Error`. `server_utils/vectors` is a small standalone Go
+variants collapse into one `#[from] colbin::Error`. `auth_limiter/vectors` is a small standalone Go
 module that prints the session-token vectors the tests assert, so regenerating them after a format
 change is a command rather than an archaeology exercise.
 

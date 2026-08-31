@@ -42,7 +42,7 @@ const CGROUP_SEARCH_RETRY: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub struct ServiceUnits {
     pub backend: String,
-    pub server_utils: String,
+    pub auth_limiter: String,
     pub search: String,
     pub scylla: String,
 }
@@ -152,7 +152,7 @@ impl SystemMetricsCollector {
             network_rx_rate,
             network_tx_rate,
             backend: make_service(0),
-            server_utils: make_service(1),
+            auth_limiter: make_service(1),
             search: make_service(2),
             scylla: make_service(3),
         })
@@ -161,7 +161,7 @@ impl SystemMetricsCollector {
     fn unit_names(&self) -> [&str; 4] {
         [
             &self.units.backend,
-            &self.units.server_utils,
+            &self.units.auth_limiter,
             &self.units.search,
             &self.units.scylla,
         ]
@@ -503,7 +503,7 @@ mod tests {
             root.clone(),
             ServiceUnits {
                 backend: "late.service".into(),
-                server_utils: String::new(),
+                auth_limiter: String::new(),
                 search: String::new(),
                 scylla: String::new(),
             },
@@ -655,7 +655,7 @@ mod tests {
             PathBuf::from("/nonexistent/cgroup/root"),
             ServiceUnits {
                 backend: "genix.service".into(),
-                server_utils: "genix-server-utils.service".into(),
+                auth_limiter: "auth-limiter.service".into(),
                 search: "genixsearch.service".into(),
                 scylla: "scylla-server.service".into(),
             },
@@ -671,7 +671,7 @@ mod tests {
             .expect("the second sample must produce a row");
         for service in [
             sample.backend,
-            sample.server_utils,
+            sample.auth_limiter,
             sample.search,
             sample.scylla,
         ] {

@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use genix_server_utils::{
+use auth_limiter::{
     limiter::{
         aggregation::UsageKey,
         credits_blob::Credits,

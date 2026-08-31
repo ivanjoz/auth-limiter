@@ -55,7 +55,8 @@ impl ServerMetricsWriter {
         // untrusted reaches this string.
         //
         // Every column is named: the Go side owns these names, and a rename there fails the
-        // prepare instead of writing values into the wrong columns.
+        // prepare instead of writing values into the wrong columns. server_utils_* predates this
+        // crate's rename to auth-limiter and stays: the table already holds rows under it.
         let insert_statement = format!(
             "INSERT INTO server_metrics (date, slot, cpu_percent, mem_percent, disk_percent, \
              net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
@@ -117,7 +118,7 @@ impl ServerMetricsWriter {
             let mut collector = SystemMetricsCollector::new(
                 ServiceUnits {
                     backend: config.backend_unit.clone(),
-                    server_utils: config.server_utils_unit.clone(),
+                    auth_limiter: config.auth_limiter_unit.clone(),
                     search: config.search_unit.clone(),
                     scylla: config.scylla_unit.clone(),
                 },
@@ -247,8 +248,8 @@ fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 15] {
         sample.network_tx_rate,
         sample.backend.memory_mb,
         sample.backend.cpu_percent,
-        sample.server_utils.memory_mb,
-        sample.server_utils.cpu_percent,
+        sample.auth_limiter.memory_mb,
+        sample.auth_limiter.cpu_percent,
         sample.search.memory_mb,
         sample.search.cpu_percent,
         sample.scylla.memory_mb,
@@ -318,7 +319,7 @@ mod tests {
                 memory_mb: 6,
                 cpu_percent: 7,
             },
-            server_utils: crate::sysmetrics::ServiceSample {
+            auth_limiter: crate::sysmetrics::ServiceSample {
                 memory_mb: 8,
                 cpu_percent: 9,
             },

@@ -2,7 +2,7 @@
 
 Status: implemented, including Go-side size-to-credit formulas and TCP client integration.
 
-Target: `server_utils/`
+Target: `auth_limiter/`
 
 ## 1. Goal
 
@@ -448,7 +448,7 @@ services and the config they share and nothing else.
 
 ```text
 # Purpose: Keep protocol, business rules, persistence, and process wiring independently testable.
-server_utils/
+auth_limiter/
 ├── Cargo.toml
 ├── README.md
 ├── PLAN.md

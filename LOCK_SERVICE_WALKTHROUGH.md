@@ -53,7 +53,7 @@ B and C are not wrong to be refused — they are the abuse pattern. What matters
 ## 3. Who talks to whom
 
 ```
-browser                backend (Go, Lambda)              server-utils (Rust daemon)
+browser                backend (Go, Lambda)              auth-limiter (Rust daemon)
    │                          │                                    │
    │── POST p-signup-request ▶│                                    │
    │                          │──── TCP connect ──────────────────▶│
@@ -148,7 +148,7 @@ Client IP `203.0.113.45`, first frame on a fresh connection (sequence 0).
 core.AcquireLock(ctx, core.ActionSignUpByIP /* =1 */, 3405803821, 2 /* max waiters */)
 
 // wait (5s, how long we will queue) and lease (15s, the daemon's deadline on us while we
-// hold) are constants in backend/core/server_utils/locks.go, not per-call-site knobs.
+// hold) are constants in backend/core/auth_limiter/locks.go, not per-call-site knobs.
 ```
 
 **Step 3 — the frame on the wire.** 24 bytes:
@@ -164,7 +164,7 @@ core.AcquireLock(ctx, core.ActionSignUpByIP /* =1 */, 3405803821, 2 /* max waite
  └───────────────────────────────────────────────────── opcode LOCK_ACQUIRE
 ```
 
-**Step 4 — the daemon decides.** `server_utils/src/lock/registry.rs:82`
+**Step 4 — the daemon decides.** `auth_limiter/src/lock/registry.rs:82`
 
 ```
 key = (1, 3405803821)

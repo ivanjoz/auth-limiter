@@ -12,7 +12,7 @@ use axum::{
     http::{Request, StatusCode, header},
     response::Response,
 };
-use genix_server_utils::bridge::{
+use auth_limiter::bridge::{
     auth::{SERVICE_AUTH_HEADER, make_service_auth_header},
     channel::ChannelRegistry,
     http::{BridgeState, routes},
@@ -28,7 +28,7 @@ const TEST_SECRET: &[u8] = b"K1OzWIN0yarCc9ge";
 
 /// A colbin session token for company 7 / user 42 / "tester", produced by the Go
 /// `colbin.Marshal` + `core.ComputeUsuarioTokenHash` with TEST_SECRET, and printed by
-/// `go run ./server_utils/vectors`.
+/// `go run ./auth_limiter/vectors`.
 const SESSION_TOKEN: &str = "Q5mjBvVTyUTj9mc7Ts4bJyNY1FI+iZwkAv4B";
 
 /// Channel token for company 7 / user 42 / tab "N2xQaG8x", pinned by the cross-language vectors.

@@ -1,17 +1,17 @@
-# Auth-Limiter + Server Utils
+# Auth-Limiter
 
 One Rust process hosting four server-side services over two transports:
 
 | Service | Transport | Port | Purpose |
 |---|---|---|---|
-| Access gate + credit limiter | Raw TCP, loopback | `server_utils` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
-| Lock service | Raw TCP, same port | `server_utils` | Serializes an action across concurrent Lambdas. |
-| Request log | Raw TCP, same port | `server_utils` | One row per finished request, plus the code lines that failed. |
+| Access gate + credit limiter | Raw TCP, loopback | `auth_limiter` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
+| Lock service | Raw TCP, same port | `auth_limiter` | Serializes an action across concurrent Lambdas. |
+| Request log | Raw TCP, same port | `auth_limiter` | One row per finished request, plus the code lines that failed. |
 | SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between the backend and browser tabs, authenticating both ends. |
 
 The limiter, the lock and the request log share the port, the connection, and the handshake —
 nothing else. Each opcode has its own frame width, its own codec, and its own module. That shared port is why its
-address is the root-level `server_utils` key rather than something under `[rate_limit]`: it
+address is the root-level `auth_limiter` key rather than something under `[rate_limit]`: it
 belongs to the process, not to any one service inside it.
 
 The bridge shares nothing with either but the process: the config load, the shutdown signal, and
@@ -30,7 +30,7 @@ to end, with the exact bytes. Designs: [PLAN.md](PLAN.md) (rate limiter, includi
 formats), [PLAN_LOCK_SERVICE.md](PLAN_LOCK_SERVICE.md) and
 [PLAN_MULTIPLEXING.md](PLAN_MULTIPLEXING.md) (lock service),
 [PLAN_SSE_BRIDGE.md](PLAN_SSE_BRIDGE.md) (bridge). Deployment:
-[`../scripts/configure/CONFIGURE_SERVER_UTILS.md`](../scripts/configure/CONFIGURE_SERVER_UTILS.md).
+[`../scripts/configure/CONFIGURE_AUTH_LIMITER.md`](../scripts/configure/CONFIGURE_AUTH_LIMITER.md).
 
 > **One process, shared fate.** The rate limiter loads existing usage from ScyllaDB before
 > admitting anything and exits when it cannot — which also stops the bridge. Deploy the backend
@@ -126,7 +126,7 @@ quota state and must not write the same absolute rows.
 
 ## Configuration
 
-Add `[server_utils]` and `[rate_limit]` to the project `config.toml`; the complete commented
+Add `[auth_limiter]` and `[rate_limit]` to the project `config.toml`; the complete commented
 example is in [`../config.example.toml`](../config.example.toml).
 
 ```toml
@@ -140,7 +140,7 @@ example is in [`../config.example.toml`](../config.example.toml).
 #
 # public = true puts the port on the open internet. Frames are HMAC-authenticated but NOT
 # encrypted, so it is only worth it when the backend runs off-box (Lambda, for instance).
-[server_utils]
+[auth_limiter]
 host   = "127.0.0.1"
 port   = 14013
 public = false
@@ -169,7 +169,7 @@ user_inference_1h     = 5000
 
 The eight burst/hour ceilings are the only settings here with no built-in default: a guessed quota
 is worse than none, so the process refuses to start without them. Since that refusal is a
-three-second crash loop under `Restart=always`, the nested Server Utils installer writes these
+three-second crash loop under `Restart=always`, the nested Auth Limiter installer writes these
 defaults into `config.toml` when they are absent, rather than leaving the daemon to discover it.
 
 The lock service adds process-wide ceilings only — per-action policy stays in the Go call sites:
@@ -228,7 +228,7 @@ selected backend serves its own `/agent/stream`.
 
 ```bash
 # Purpose: Compile and verify all protocol, codec, limiter, lock, and flush tests.
-cd server_utils
+cd auth_limiter
 cargo test
 cargo build --release
 ```
@@ -240,7 +240,7 @@ everything it held.
 
 Building needs a C compiler even though no crate here contains C: rustc shells out to `cc` to
 link, and a `build.rs` is itself an executable that has to be linked before cargo can run it.
-`../scripts/configure/configure_server_utils.py` installs one when the host has none.
+`../scripts/configure/configure_auth_limiter.py` installs one when the host has none.
 
 For a host that should compile nothing, build a static binary and ship it instead. `.cargo/
 config.toml` pins `rust-lld` for the musl targets, which is also what makes cross-building arm64
@@ -253,8 +253,8 @@ cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 Every versioned [Genix GitHub Release](https://github.com/ivanjoz/genix/releases) also publishes
-these static outputs as `genix-server-utils_linux_amd64` and
-`genix-server-utils_linux_arm64`. Downloading `latest` is convenient for a manual install; replace
+these static outputs as `auth-limiter_linux_amd64` and
+`auth-limiter_linux_arm64`. Downloading `latest` is convenient for a manual install; replace
 `latest/download` with `download/vX.Y.Z` to pin production automation to an immutable release.
 
 ```bash
@@ -267,7 +267,7 @@ esac
 
 # Download the public binary and the manifest without requiring a GitHub token.
 release_base_url=https://github.com/ivanjoz/genix/releases/latest/download
-release_asset="genix-server-utils_linux_${release_architecture}"
+release_asset="auth-limiter_linux_${release_architecture}"
 curl --fail --location --output "$release_asset" "${release_base_url}/${release_asset}"
 curl --fail --location --output SHA256SUMS "${release_base_url}/SHA256SUMS"
 
@@ -286,11 +286,11 @@ go run . generate_controllers
 go run . check_tables
 ```
 
-Run locally from `server_utils/` (it finds `../config.toml`):
+Run locally from `auth_limiter/` (it finds `../config.toml`):
 
 ```bash
 # Purpose: Enable detailed request and flush diagnostics during local development.
-RUST_LOG=genix_server_utils=debug cargo run
+RUST_LOG=auth_limiter=debug cargo run
 ```
 
 ## SSE bridge HTTP contract
@@ -636,7 +636,7 @@ nothing — everything comes from `config.toml` — and installs a C compiler if
 After starting the service it probes `/health` rather than trusting `systemctl restart`: this daemon
 exits when ScyllaDB is unreachable, which with `Restart=always` looks identical to a healthy start.
 The generated unit and the three non-negotiable Nginx streaming settings are in
-[`../scripts/configure/CONFIGURE_SERVER_UTILS.md`](../scripts/configure/CONFIGURE_SERVER_UTILS.md).
+[`../scripts/configure/CONFIGURE_AUTH_LIMITER.md`](../scripts/configure/CONFIGURE_AUTH_LIMITER.md).
 
 For a self-hosted backend, select both components (`237` or `238`) and choose Backend mode `1` or
 `2`: the dispatcher then installs this daemon without its public SSE Nginx vhost and does not

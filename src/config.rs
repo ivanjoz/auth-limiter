@@ -57,7 +57,7 @@ const DEFAULT_SERVER_METRICS_TTL_DAYS: u64 = 30;
 /// storage: fewer than three seconds a slot overflows it.
 const MINIMUM_SERVER_METRICS_ROW_SECONDS: u64 = 3;
 const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
-const DEFAULT_SERVER_METRICS_SERVER_UTILS_UNIT: &str = "genix-server-utils.service";
+const DEFAULT_SERVER_METRICS_AUTH_LIMITER_UNIT: &str = "auth-limiter.service";
 const DEFAULT_SERVER_METRICS_SEARCH_UNIT: &str = "genixsearch.service";
 const DEFAULT_SERVER_METRICS_SCYLLA_UNIT: &str = "scylla-server.service";
 
@@ -112,7 +112,7 @@ pub struct ServerMetricsConfig {
     /// systemd units under `system.slice`. An absent one is not an error: the backend has no unit
     /// at all when it runs on Lambda, which is the case the `-1` sentinel exists for.
     pub backend_unit: String,
-    pub server_utils_unit: String,
+    pub auth_limiter_unit: String,
     pub search_unit: String,
     pub scylla_unit: String,
 }
@@ -142,7 +142,7 @@ pub struct BridgeConfig {
 impl AppConfig {
     pub fn load() -> Result<Self> {
         let config = load_config()?;
-        // [server_utils] is its own section, not a key under [rate_limit]: this one port serves
+        // [auth_limiter] is its own section, not a key under [rate_limit]: this one port serves
         // every raw-TCP operation and the frame's opcode picks the service, so it belongs to the
         // process, not to one of the services running inside it.
         //
@@ -150,13 +150,13 @@ impl AppConfig {
         // client's half of this section. Binding a literal host cannot work behind NAT — a cloud
         // VM's public IP is never on its NIC, so bind returns EADDRNOTAVAIL and the daemon dies at
         // startup. A boolean has no such unrepresentable state.
-        let listen_port = optional_u64(&config, "SERVER_UTILS_PORT", "server_utils.port")?
+        let listen_port = optional_u64(&config, "AUTH_LIMITER_PORT", "auth_limiter.port")?
             .unwrap_or(u64::from(DEFAULT_LISTEN_PORT));
         let listen_port = u16::try_from(listen_port)
             .ok()
             .filter(|port| *port > 0)
-            .context("server_utils.port must be a port number between 1 and 65535")?;
-        let listen_octets = if optional_bool(&config, "SERVER_UTILS_PUBLIC", "server_utils.public")
+            .context("auth_limiter.port must be a port number between 1 and 65535")?;
+        let listen_octets = if optional_bool(&config, "AUTH_LIMITER_PUBLIC", "auth_limiter.public")
         {
             [0, 0, 0, 0]
         } else {
@@ -417,10 +417,10 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
             "server_metrics.backend_unit",
             DEFAULT_SERVER_METRICS_BACKEND_UNIT,
         ),
-        server_utils_unit: unit_name(
-            "SERVER_METRICS_SERVER_UTILS_UNIT",
-            "server_metrics.server_utils_unit",
-            DEFAULT_SERVER_METRICS_SERVER_UTILS_UNIT,
+        auth_limiter_unit: unit_name(
+            "SERVER_METRICS_AUTH_LIMITER_UNIT",
+            "server_metrics.auth_limiter_unit",
+            DEFAULT_SERVER_METRICS_AUTH_LIMITER_UNIT,
         ),
         search_unit: unit_name(
             "SERVER_METRICS_SEARCH_UNIT",
@@ -634,11 +634,11 @@ mod tests {
     fn a_toml_boolean_is_read_as_a_flag() {
         // `public = true` is a real TOML boolean, not a quoted one: value_text has to decode that
         // arm or the daemon silently keeps binding loopback and the off-box backend never connects.
-        let config: Table = toml::from_str("[server_utils]\npublic = true").unwrap();
-        assert!(optional_bool(&config, "IGNORED", "server_utils.public"));
+        let config: Table = toml::from_str("[auth_limiter]\npublic = true").unwrap();
+        assert!(optional_bool(&config, "IGNORED", "auth_limiter.public"));
 
-        let private: Table = toml::from_str("[server_utils]\nport = 14013").unwrap();
-        assert!(!optional_bool(&private, "IGNORED", "server_utils.public"));
+        let private: Table = toml::from_str("[auth_limiter]\nport = 14013").unwrap();
+        assert!(!optional_bool(&private, "IGNORED", "auth_limiter.public"));
     }
 
     /// The section is optional, and its defaults are what the nested deployment scripts under
